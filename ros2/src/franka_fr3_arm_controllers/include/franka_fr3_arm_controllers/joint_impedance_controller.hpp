@@ -19,6 +19,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <string>
+#include <atomic>
+#include <std_srvs/srv/trigger.hpp>
 #include "franka_fr3_arm_controllers/motion_generator.hpp"
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -53,20 +55,67 @@ class JointImpedanceController : public controller_interface::ControllerInterfac
   Vector7d d_gains_;
   double k_alpha_;
   bool move_to_start_position_finished_{false};
-  bool motion_generator_initialized_{false};
   rclcpp::Time start_time_;
+  rclcpp::Time start_position_time_;
   std::unique_ptr<MotionGenerator> motion_generator_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_subscriber_ = nullptr;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr sync_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr replay_service_;
   bool gello_position_values_valid_ = false;
+  std::atomic<bool> start_request_received_ = false;
+  std::atomic<bool> sync_request_received_ = false;
+  std::atomic<bool> stop_request_received_ = false;
+  std::atomic<bool> replay_request_received_ = false;
   std::array<double, 7> gello_position_values_{0, 0, 0, 0, 0, 0, 0};
   rclcpp::Time last_joint_state_time_;
 
   Vector7d calculateTauDGains_(const Vector7d& q_goal);
   bool validateGains_(const std::vector<double>& gains, const std::string& gains_name);
-  bool initializeMotionGenerator_();
+  void initializeMotionGenerator_();
   void updateJointStates_();
   void validateGelloPositions_(const sensor_msgs::msg::JointState& msg);
   void jointStateCallback_(const sensor_msgs::msg::JointState msg);
+  void startServiceCallback_(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+    const std::shared_ptr<std_srvs::srv::Trigger::Response> response
+  ) {
+    RCLCPP_INFO(get_node()->get_logger(), "Start request received...");
+      sync_request_received_ = false;
+      stop_request_received_ = false;
+      start_request_received_ = true;
+      response->success = true;
+      response->message = "start service triggered successfully";
+  };
+  void syncServiceCallback_(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+    const std::shared_ptr<std_srvs::srv::Trigger::Response> response
+  ) {
+      start_request_received_ = true; // Ensure start is also true
+      sync_request_received_ = true;
+      response->success = true;
+      response->message = "sync service triggered successfully";
+  };
+  void stopServiceCallback_(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+    const std::shared_ptr<std_srvs::srv::Trigger::Response> response
+  ) {
+      start_request_received_ = false;
+      sync_request_received_ = false;
+      stop_request_received_ = true;
+      response->success = true;
+      response->message = "stop service triggered successfully";
+  };
+  void replayServiceCallback_(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+    const std::shared_ptr<std_srvs::srv::Trigger::Response> response
+  ) {
+      RCLCPP_INFO(get_node()->get_logger(), "Replay request received...");
+      replay_request_received_ = true;
+      response->success = true;
+      response->message = "replay service triggered successfully";
+  };
 };
 
 }  // namespace franka_fr3_arm_controllers

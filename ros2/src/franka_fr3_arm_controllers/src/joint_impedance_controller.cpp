@@ -54,45 +54,42 @@ controller_interface::return_type JointImpedanceController::update(
   updateJointStates_();
   Vector7d q_goal;
   Vector7d tau_d_calculated;
+  double gain_factor = 1.0;
 
-  if (!motion_generator_initialized_) {
-    // After starting the controller we wait for valid joint states from the input topic
-    // Until we get valid joint states we will send zero torques to the robot
-    // to allow the user to reposition the robot
-    motion_generator_initialized_ = initializeMotionGenerator_();
-
-    if (!motion_generator_initialized_) {
-      for (int i = 0; i < num_joints; ++i) {
-        command_interfaces_[i].set_value(0.0);
-      }
-
-      return controller_interface::return_type::OK;
-    }
+  if (stop_request_received_) {
+      RCLCPP_FATAL(get_node()->get_logger(), "Stop request received. Exiting controller.");
+      rclcpp::shutdown();  // Exit the node permanently
   }
 
   if (!move_to_start_position_finished_) {
-    // We have received valid joint states and initialized the motion generator
-    // Now we move smoothly to the first joint position received from the input topic
     auto trajectory_time = this->get_node()->now() - start_time_;
     auto motion_generator_output = motion_generator_->getDesiredJointPositions(trajectory_time);
     move_to_start_position_finished_ = motion_generator_output.second;
-
+    if (move_to_start_position_finished_) {
+      start_position_time_ = this->get_node()->now();
+    }
     q_goal = motion_generator_output.first;
   }
-
+  
   if (move_to_start_position_finished_) {
-    // After reaching the start position we follow the joint position from the input topic
-    // This is the normal operation mode of the controller
     if (!gello_position_values_valid_) {
-      RCLCPP_FATAL(get_node()->get_logger(), "Timeout: No valid joint states received from Gello");
-      rclcpp::shutdown();  // Exit the node permanently
+      // RCLCPP_FATAL(get_node()->get_logger(), "Timeout: No valid joint states received from Gello");
+      // rclcpp::shutdown();  // Exit the node permanently
+      for (int i = 0; i < num_joints; ++i) {
+        command_interfaces_[i].set_value(0.0);
+      }
+      return controller_interface::return_type::OK;
     }
     for (int i = 0; i < num_joints; ++i) {
       q_goal(i) = gello_position_values_[i];
     }
+    const auto current_time = this->get_node()->now();
+    const double duration_ramp = 1.0;
+    const double duration_since_start_position = (current_time - start_position_time_).seconds();
+    gain_factor = std::min(1.0, std::max(0.0, duration_since_start_position / duration_ramp));
   }
 
-  tau_d_calculated = calculateTauDGains_(q_goal);
+  tau_d_calculated = gain_factor * calculateTauDGains_(q_goal);
 
   for (int i = 0; i < num_joints; ++i) {
     command_interfaces_[i].set_value(tau_d_calculated(i));
@@ -111,7 +108,6 @@ void JointImpedanceController::jointStateCallback_(const sensor_msgs::msg::Joint
                 "Received joint state size is smaller than expected size.");
     return;
   }
-
   std::copy(msg.position.begin(), msg.position.begin() + gello_position_values_.size(),
             gello_position_values_.begin());
 
@@ -180,12 +176,61 @@ CallbackReturn JointImpedanceController::on_configure(
       "gello/joint_states", 1,
       [this](const sensor_msgs::msg::JointState& msg) { jointStateCallback_(msg); });
 
+  sync_service_ = get_node()->create_service<std_srvs::srv::Trigger>(
+      "sync_service",
+      std::bind(&JointImpedanceController::syncServiceCallback_, 
+                this, 
+                std::placeholders::_1, 
+                std::placeholders::_2)
+  );
+
+  stop_service_ = get_node()->create_service<std_srvs::srv::Trigger>(
+      "stop_service",
+      std::bind(&JointImpedanceController::stopServiceCallback_,
+                this,
+                std::placeholders::_1,
+                std::placeholders::_2)
+  );
+
+  start_service_ = get_node()->create_service<std_srvs::srv::Trigger>(
+      "start_service",
+      std::bind(&JointImpedanceController::startServiceCallback_,
+                this,
+                std::placeholders::_1,
+                std::placeholders::_2)
+  );
+
+  replay_service_ = get_node()->create_service<std_srvs::srv::Trigger>(
+      "replay_service",
+      std::bind(&JointImpedanceController::replayServiceCallback_,
+                this,
+                std::placeholders::_1,
+                std::placeholders::_2)
+  );
+
   return CallbackReturn::SUCCESS;
 }
 
 CallbackReturn JointImpedanceController::on_activate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
+  while (!start_request_received_ && !replay_request_received_) {
+    RCLCPP_WARN(get_node()->get_logger(), "Waiting for start or replay request...");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  }
+
+  if(replay_request_received_){
+    RCLCPP_INFO(get_node()->get_logger(), "Replay request received...");
+    move_to_start_position_finished_ = true;
+    start_position_time_ = this->get_node()->now();
   last_joint_state_time_ = get_node()->now();
+  }else{
+    while (!sync_request_received_) {
+      RCLCPP_WARN(get_node()->get_logger(), "Waiting for sync request...");
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+    initializeMotionGenerator_();
+  }
+
   dq_filtered_.setZero();
   start_time_ = this->get_node()->now();
 
@@ -221,8 +266,8 @@ void JointImpedanceController::validateGelloPositions_(const sensor_msgs::msg::J
   auto current_time = get_node()->now();
   auto time_since_last_joint_state = (current_time - last_joint_state_time_).seconds();
   auto time_since_msg_stamp = (current_time - msg.header.stamp).seconds();
-  gello_position_values_valid_ =
-      (time_since_last_joint_state < max_time_diff && time_since_msg_stamp < max_time_diff);
+  gello_position_values_valid_ = true;
+      // (time_since_last_joint_state < max_time_diff && time_since_msg_stamp < max_time_diff);
   if (!gello_position_values_valid_) {
     RCLCPP_WARN(get_node()->get_logger(),
                 "Gello position values are not valid. Time since last joint state: %f // Time "
@@ -244,12 +289,12 @@ void JointImpedanceController::updateJointStates_() {
   }
 }
 
-bool JointImpedanceController::initializeMotionGenerator_() {
-  if (!gello_position_values_valid_) {
-    // Only send a warning once every 10 seconds in order not to spam the log
-    RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 10 * 1000,
-                         "Waiting for valid joint states...");
-    return false;
+void JointImpedanceController::initializeMotionGenerator_() {
+  last_joint_state_time_ = get_node()->now();
+  while (!gello_position_values_valid_) {
+    RCLCPP_WARN(get_node()->get_logger(), "Waiting for valid joint states...");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    last_joint_state_time_ = get_node()->now();
   }
 
   Vector7d q_goal;
@@ -262,7 +307,6 @@ bool JointImpedanceController::initializeMotionGenerator_() {
 
   const double motion_generator_speed_factor = 0.2;
   motion_generator_ = std::make_unique<MotionGenerator>(motion_generator_speed_factor, q_, q_goal);
-  return true;
 }
 
 }  // namespace franka_fr3_arm_controllers
