@@ -171,6 +171,13 @@ def generate_robot_nodes(context):
             condition=UnlessCondition(LaunchConfiguration("use_fake_hardware")),
             output="screen",
         ),
+        Node(
+            package="controller_manager",
+            executable="spawner",
+            namespace=namespace,
+            arguments=["joint_impedance_controller"],
+            output="screen",
+        ),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 [

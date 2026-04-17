@@ -56,6 +56,35 @@ controller_interface::return_type JointImpedanceController::update(
   Vector7d tau_d_calculated;
   double gain_factor = 1.0;
 
+  // Idle with zero torques until a start or replay request is received
+  if (!start_request_received_ && !replay_request_received_) {
+    for (int i = 0; i < num_joints; ++i) {
+      command_interfaces_[i].set_value(0.0);
+    }
+    return controller_interface::return_type::OK;
+  }
+
+  // Handle replay/start transitions (one-time setup)
+  if (!activated_) {
+    if (replay_request_received_) {
+      RCLCPP_INFO(get_node()->get_logger(), "Replay request received...");
+      move_to_start_position_finished_ = true;
+      start_position_time_ = this->get_node()->now();
+      last_joint_state_time_ = get_node()->now();
+    } else {
+      // Wait for sync before proceeding
+      if (!sync_request_received_) {
+        for (int i = 0; i < num_joints; ++i) {
+          command_interfaces_[i].set_value(0.0);
+        }
+        return controller_interface::return_type::OK;
+      }
+      last_joint_state_time_ = get_node()->now();
+    }
+    start_time_ = this->get_node()->now();
+    activated_ = true;
+  }
+
   if (!motion_generator_initialized_) {
     // After starting the controller we wait for valid joint states from the input topic
     // Until we get valid joint states we will send zero torques to the robot
@@ -216,24 +245,6 @@ CallbackReturn JointImpedanceController::on_configure(
 
 CallbackReturn JointImpedanceController::on_activate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
-  while (!start_request_received_ && !replay_request_received_) {
-    RCLCPP_WARN(get_node()->get_logger(), "Waiting for start or replay request...");
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-  }
-
-  if (replay_request_received_) {
-    RCLCPP_INFO(get_node()->get_logger(), "Replay request received...");
-    move_to_start_position_finished_ = true;
-    start_position_time_ = this->get_node()->now();
-    last_joint_state_time_ = get_node()->now();
-  } else {
-    while (!sync_request_received_) {
-      RCLCPP_WARN(get_node()->get_logger(), "Waiting for sync request...");
-      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    }
-    last_joint_state_time_ = get_node()->now();
-  }
-
   dq_filtered_.setZero();
   start_time_ = this->get_node()->now();
 
